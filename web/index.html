@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dance Pulse — 舞种识别</title>
+  <style>
+    :root {
+      --bg: #0f1220; --card: #1a1f35; --text: #e8eaf6; --muted: #8b93b0;
+      --accent: #6c8cff; --ok: #34d399; --bar: #2b3358;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: "Segoe UI", system-ui, sans-serif;
+      display: flex; flex-direction: column; align-items: center; min-height: 100vh;
+    }
+    h1 { font-size: 1.4rem; margin: 1.2rem 0 .2rem; }
+    .sub { color: var(--muted); font-size: .85rem; margin-bottom: 1rem; }
+    .row { display: flex; gap: 1.2rem; flex-wrap: wrap; justify-content: center; padding: 0 1rem; }
+    .card {
+      background: var(--card); border-radius: 14px; padding: 1rem;
+      box-shadow: 0 8px 30px rgba(0,0,0,.35);
+    }
+    video, canvas#preview {
+      width: 320px; height: 240px; object-fit: cover;
+      border-radius: 10px; background: #000; display: block;
+    }
+    canvas#preview { display: none; }
+    .controls { margin-top: .8rem; display: flex; gap: .6rem; }
+    button {
+      background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+      padding: .55rem 1.1rem; font-size: .95rem; cursor: pointer;
+    }
+    button.secondary { background: var(--bar); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .status { margin-top: .7rem; font-size: .85rem; color: var(--muted); }
+    .status.ok { color: var(--ok); }
+    .pred-name {
+      font-size: 2rem; font-weight: 700; text-align: center;
+      padding: .8rem 0 .2rem; min-height: 3.4rem;
+    }
+    .pred-conf { text-align: center; color: var(--muted); font-size: .95rem; margin-bottom: 1rem; }
+    .bar-row { display: flex; align-items: center; gap: .6rem; margin: .35rem 0; }
+    .bar-label { width: 96px; font-size: .82rem; text-align: right; }
+    .bar-track { flex: 1; height: 16px; background: var(--bar); border-radius: 8px; overflow: hidden; }
+    .bar-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 8px; transition: width .18s ease; }
+    .bar-val { width: 52px; font-size: .8rem; color: var(--muted); }
+    .badge {
+      display: inline-block; font-size: .72rem; padding: .15rem .5rem;
+      border-radius: 6px; background: var(--bar); color: var(--muted); margin-left: .5rem;
+      vertical-align: middle;
+    }
+    .url-row { display: flex; gap: .6rem; margin-top: .8rem; }
+    #urlInput {
+      flex: 1; background: var(--bar); border: 0; border-radius: 8px;
+      color: var(--text); padding: .55rem .8rem; font-size: .85rem; min-width: 260px;
+    }
+    .metrics {
+      display: flex; gap: .6rem; margin-top: .7rem; flex-wrap: wrap; justify-content: center;
+    }
+    .metric {
+      background: var(--bar); border-radius: 8px; padding: .4rem .7rem;
+      font-size: .8rem; color: var(--muted);
+    }
+    .metric b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .metric.bad b { color: #f87171; }
+    .metric.ok b { color: var(--ok); }
+    .feedback {
+      margin-top: .8rem; padding-top: .7rem; border-top: 1px solid var(--bar);
+    }
+    .fb-title { font-size: .82rem; color: var(--muted); margin-bottom: .5rem; }
+    .fb-title span { margin-left: .5rem; color: var(--ok); }
+  </style>
+</head>
+<body>
+  <h1>Dance Pulse — 实时舞种识别</h1>
+  <div class="sub">YouTube 直链播放 → asyncio FFmpeg 抽帧 → ONNX CUDA 1Hz 滑窗推理</div>
+
+  <div class="row">
+    <div class="card">
+      <video id="video" playsinline muted></video>
+      <canvas id="preview" width="112" height="112"></canvas>
+      <div class="url-row">
+        <input id="urlInput" type="text" placeholder="粘贴 YouTube URL" />
+      </div>
+      <div class="controls">
+        <button id="startBtn">播放并推理</button>
+        <button id="stopBtn" class="secondary" disabled>停止</button>
+      </div>
+      <div id="status" class="status">未连接</div>
+      <div class="metrics">
+        <div class="metric" id="ttffBox">首帧 TTFF <b id="ttff">—</b></div>
+        <div class="metric" id="e2eBox">端到端 <b id="e2e">—</b></div>
+        <div class="metric" id="ttfpBox">首条预测 <b id="ttfp">—</b></div>
+      </div>
+    </div>
+
+    <div class="card" style="min-width: 320px;">
+      <div class="pred-name" id="predName">—</div>
+      <div class="pred-conf" id="predConf">等待推理…</div>
+      <div id="bars"></div>
+      <div class="feedback">
+        <div class="fb-title">这条预测对吗？<span id="fbStatus"></span></div>
+        <div class="controls">
+          <button id="fbOkBtn" class="secondary" disabled>准确</button>
+          <button id="fbBadBtn" class="secondary" disabled>有误</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/main.js"></script>
+</body>
+</html>

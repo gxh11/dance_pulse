@@ -1,0 +1,19 @@
+# 构建上下文瘦身: 部署只需 4 个服务端 .py + requirements.txt + web 构建源
+.git
+.trae
+__pycache__/
+*.pyc
+debug.log
+
+# 前端 (node_modules/dist 不进构建上下文, dist 由镜像内构建生成)
+web/node_modules/
+web/dist/
+
+# 大文件目录: 权重经 volume 挂载, 数据集/帧缓存与部署无关
+checkpoints/
+frame_cache/
+dance_dataset_categorized/
+aistplusplus_dataset/
+splits/
+*.mp4
+*.pth

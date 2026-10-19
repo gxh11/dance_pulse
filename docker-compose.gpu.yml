@@ -1,0 +1,12 @@
+# GPU 覆盖层: 叠加在 docker-compose.yml 之上, 打开 NVIDIA GPU 直通
+#   用法: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#   前提: 宿主机已装 NVIDIA 驱动 + NVIDIA Container Toolkit
+services:
+  dance-pulse:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

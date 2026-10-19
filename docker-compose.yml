@@ -1,0 +1,24 @@
+# Dance Pulse 一键部署 (CPU 版)
+#   启动: docker compose up -d --build     -> http://localhost:8001
+#   GPU:  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#   停止: docker compose down
+services:
+  dance-pulse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dance-pulse:latest
+    container_name: dance-pulse
+    ports:
+      - "8001:8001"
+    volumes:
+      # 权重/ONNX 从宿主机挂载 (只读), 不打包进镜像
+      - ./checkpoints:/app/checkpoints:ro
+    restart: unless-stopped
+    healthcheck:
+      # 镜像内无 curl, 用 python 探活
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s   # 首次启动含模型加载 + ONNX 预热

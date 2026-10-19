@@ -1,0 +1,26 @@
+# dance-pulse 项目依赖
+# torch/torchvision 需 CUDA 12.8 构建（RTX 5060 / Blackwell 架构），必须用官方 cu128 源:
+#   pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+
+# 数据处理与训练
+numpy==2.4.6
+opencv-python==5.0.0.93
+scikit-learn==1.9.1
+matplotlib==3.11.2
+seaborn==0.13.2
+
+# 视频下载 (getvideo.py / download_direct.py)
+yt-dlp==2026.8.19
+imageio-ffmpeg==0.6.0
+
+# 流式服务端 (server.py: FastAPI + WebSocket)
+fastapi==0.143.1
+uvicorn[standard]==0.54.0
+websockets==17.2
+httpx==0.28.1
+
+# ONNX 推理 (server.py: ONNX Runtime CUDA, 需先 import torch 使 DLL 可见)
+# 注意: onnxruntime-gpu 1.22.0 对应 CUDA 12.x; 1.23+ 需 CUDA 13, 与本环境 torch cu128 不兼容
+onnxruntime-gpu==1.22.0
