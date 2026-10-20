@@ -26,6 +26,7 @@
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -69,27 +70,66 @@ PREDICT_EVERY = 4      # [摄像头模式] 每收到几帧推理一次
 DEDUP_WINDOW = 0.8     # [YouTube 模式] 帧去重窗口 (秒): 同一画面时刻只推理一次
 TARGET_SPACING = 1.0   # [YouTube 模式] 相邻两次推理的视频时间间距 -> 1Hz
 STREAM_FPS = 8         # [YouTube 模式] 推理轨抽帧速率
+# 极简抓取: 直链解析只需要 player_response 里的渐进式 mp4 URL。跳过观看页 HTML、
+# /next 初始数据、ytcfg、JS 播放器、DASH/HLS manifest 五路抓取与全量格式嗅探,
+# 单次解析从 ~1.9s (全量嗅探) 压到一次 player API 请求的量级。
 YDL_OPTS = {
     # 单流格式: 音视频已合一, 无需 ffmpeg 合并, 也不用落盘
     "format": "best[ext=mp4]/best",
     "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "noprogress": True,
     # 单次请求硬上限: 网络抖动时最坏耗时可控, 避免一个僵尸解析拖垮整个线程池
     "socket_timeout": 10,
     "retries": 1,
-    # android 客户端直链免签名解密 (少一轮请求, ~1.6s vs web 路径 ~2.5s);
+    # android 客户端直链免签名解密 (少一轮请求);
     # 被 YouTube SABR 实验掐掉直链时由 resolve_video_sync 阶梯回退
-    "extractor_args": {"youtube": {"player_client": ["android"]}},
+    "extractor_args": {"youtube": {
+        "player_client": ["android"],
+        # manifest 纯属浪费: format=best 只选音视频合一的渐进流, 不会选 DASH 分离流
+        "skip": ["dash", "hls"],
+        # 砍掉观看页/初始数据/ytcfg/JS 播放器四路额外抓取
+        "player_skip": ["webpage", "initial_data", "configs", "js"],
+    }},
 }
-# 中间回退: tv/ios 同样免签名解密, 比 web 快得多
+# 中间回退: tv/ios 同样免签名解密, 比 web 快得多。
+# 这两个客户端的流偶尔只挂在 HLS manifest 里, 保留 hls 作为无渐进流视频的兜底来源。
 YDL_OPTS_TV = {
     **YDL_OPTS,
-    "extractor_args": {"youtube": {"player_client": ["tv", "ios"]}},
+    "extractor_args": {"youtube": {
+        **YDL_OPTS["extractor_args"]["youtube"],
+        "player_client": ["tv", "ios"],
+        "skip": ["dash"],
+    }},
 }
 YDL_OPTS_WEB = {
     **YDL_OPTS,
-    # web 客户端做签名解密 + PO Token 申请, 最慢 (~20s) 但格式全, 只做最后兜底
-    "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
+    # web 客户端做签名解密 + PO Token 申请, 最慢但格式全, 只做最后兜底。
+    # 签名解密依赖 JS 播放器与 ytcfg, 故只砍观看页与 /next 初始数据。
+    "extractor_args": {"youtube": {
+        **YDL_OPTS["extractor_args"]["youtube"],
+        "player_client": ["android", "tv", "web"],
+        "skip": ["dash"],
+        "player_skip": ["webpage", "initial_data"],
+    }},
 }
+_YDL_TIERS = (YDL_OPTS, YDL_OPTS_TV, YDL_OPTS_WEB)
+
+
+# 进程内常驻单例: 每个工作线程一套 yt-dlp 实例 (thread-local), 免去每次解析重建
+# YoutubeDL 的开销; 且不引入全局锁 —— 不同 URL 的解析按线程并行互不阻塞。
+_ydl_local = threading.local()
+
+
+def _get_ydl(tier: int) -> yt_dlp.YoutubeDL:
+    pool = getattr(_ydl_local, "pool", None)
+    if pool is None:
+        pool = _ydl_local.pool = {}
+    ydl = pool.get(tier)
+    if ydl is None:
+        ydl = pool[tier] = yt_dlp.YoutubeDL(_YDL_TIERS[tier])
+    return ydl
 
 app = FastAPI(title="Dance Pulse Streaming API", version="2.0")
 MODEL = None          # PyTorch 模型 (摄像头推帧模式 / ONNX 回退)
@@ -114,6 +154,9 @@ def _startup():
     # 模型加载放后台线程: 冷启动 30-60s 期间 /resolve 等轻接口仍可即时响应,
     # 不再让前端在"解析视频中"撞 30s 超时 (请求在 lifespan 启动完成前根本不被处理)
     threading.Thread(target=_load_models, daemon=True).start()
+    # 预热 InnerTube visitorData (首个解析请求的 ~5s 冷启动惩罚在此摊掉):
+    # 与模型加载并行, 用户第一次贴 URL 时快路径已是稳态 ~0.5s
+    threading.Thread(target=_get_visitor_data, daemon=True).start()
 
 
 def _load_models():
@@ -198,11 +241,114 @@ _RESOLVE_JOBS_LOCK = threading.Lock()
 RESOLVE_CACHE: dict[str, tuple[float, dict]] = {}
 RESOLVE_CACHE_TTL = 300.0   # 直链有效期约 6h, 5min 缓存对播放/推理场景足够
 
+# ---------------------------------------------------------------------------
+# 极简抓取快路径: 进程内 httpx 常驻单例 (keep-alive 连接池) 直接请求 InnerTube
+# player 接口, 一次往返拿直链 —— 绕开 yt-dlp 的全量嗅探/多格式解析开销
+# (实测 ~0.7s vs yt-dlp ~2.5-3.2s)。ANDROID 客户端直链免签名解密, 取单流 MP4。
+# 关键: 必须带 visitorData + 完整 client/user/request context, 否则 YouTube 返回
+# 400 "Precondition check failed" (实测踩坑)。
+# 失败 (SABR 掐直链/区域限制/接口变更) 自动回退 yt-dlp 阶梯, 行为不变。
+# ---------------------------------------------------------------------------
+_INNERTUBE_CLIENT = httpx.Client(
+    timeout=httpx.Timeout(6.0),
+    limits=httpx.Limits(max_keepalive_connections=4),
+)
+_INNERTUBE_URL = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+_INNERTUBE_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"   # Android 客户端公开 InnerTube key
+_INNERTUBE_UA = "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"
+_INNERTUBE_CLIENT_VERSION = "20.10.38"
+_YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})")
+_VISITOR_RE = re.compile(r'"VISITOR_DATA":"([\w%=-]+)"')
+# 优先级: 单流 MP4 (音视频合一, 无需 ffmpeg 合流) 高清优先
+_INNERTUBE_ITAG_PRIORITY = (22, 18, 59, 13)   # 720p/360p/480p/240p mp4
+
+# visitorData 是会话令牌 (有效期数小时), 拉一次全局复用, 摊销后稳态解析 ~0.5s
+_VISITOR_CACHE: dict = {"data": None, "ts": 0.0}
+_VISITOR_TTL = 1800.0
+_VISITOR_LOCK = threading.Lock()
+
+
+def _get_visitor_data() -> str | None:
+    with _VISITOR_LOCK:
+        if _VISITOR_CACHE["data"] and time.time() - _VISITOR_CACHE["ts"] < _VISITOR_TTL:
+            return _VISITOR_CACHE["data"]
+        try:
+            r = _INNERTUBE_CLIENT.get(
+                "https://www.youtube.com/",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            m = _VISITOR_RE.search(r.text)
+            _VISITOR_CACHE["data"] = m.group(1) if m else None
+            _VISITOR_CACHE["ts"] = time.time()
+            return _VISITOR_CACHE["data"]
+        except Exception:
+            return _VISITOR_CACHE["data"]
+
+
+def _resolve_via_innertube(url: str) -> dict | None:
+    """单次 InnerTube 请求拿直链; 拿不到返回 None (走 yt-dlp 阶梯兜底)。"""
+    m = _YT_ID_RE.search(url)
+    if not m:
+        return None
+    visitor = _get_visitor_data()
+    try:
+        r = _INNERTUBE_CLIENT.post(
+            _INNERTUBE_URL + f"&key={_INNERTUBE_KEY}",
+            headers={
+                "User-Agent": _INNERTUBE_UA,
+                "Content-Type": "application/json",
+                "X-Youtube-Client-Name": "3",
+                "X-Youtube-Client-Version": _INNERTUBE_CLIENT_VERSION,
+                **({"X-Goog-Visitor-Id": visitor} if visitor else {}),
+            },
+            json={
+                "videoId": m.group(1),
+                "contentCheckOk": True,
+                "racyCheckOk": True,
+                "context": {
+                    "client": {
+                        "clientName": "ANDROID",
+                        "clientVersion": _INNERTUBE_CLIENT_VERSION,
+                        "androidSdkVersion": 30,
+                        "hl": "en", "gl": "US",
+                        "utcOffsetMinutes": 0,
+                        "clientScreen": "EMBED",
+                        **({"visitorData": visitor} if visitor else {}),
+                    },
+                    "user": {"lockedSafetyMode": False},
+                    "request": {"useSsl": True},
+                },
+            },
+        )
+        data = r.json()
+    except Exception:
+        return None
+
+    if (data.get("playabilityStatus", {}).get("status") or "") != "OK":
+        return None
+    formats = (data.get("streamingData") or {}).get("formats") or []
+    fmt = None
+    for itag in _INNERTUBE_ITAG_PRIORITY:
+        fmt = next((f for f in formats if f.get("itag") == itag and f.get("url")), None)
+        if fmt:
+            break
+    if fmt is None:
+        return None   # 该客户端无直链 (SABR) -> 回退
+
+    return {
+        "title": (data.get("videoDetails") or {}).get("title"),
+        "url": fmt["url"],
+        "ext": (fmt.get("mimeType") or "video/mp4").split(";")[0].split("/")[-1],
+        # android 直链需带原生 UA/Referer, 否则 googlevideo 403
+        "http_headers": {"User-Agent": _INNERTUBE_UA,
+                         "Referer": "https://www.youtube.com/"},
+    }
+
 
 def resolve_video_sync(url: str) -> dict:
-    """yt-dlp 解析 YouTube URL -> 播放直链 (不下载, 零落盘)。
+    """解析 YouTube URL -> 播放直链 (不下载, 零落盘)。
 
-    回退阶梯: android (免签名解密, ~2s) -> tv/ios (免签名) -> web (签名+PO Token, ~20s 兜底)。
+    极简抓取快路径 InnerTube (~0.7s); 失败回退 yt-dlp 阶梯:
+    android (免签名解密) -> tv/ios (免签名) -> web (签名+PO Token, 最慢兜底)。
     """
     cached = RESOLVE_CACHE.get(url)
     if cached and time.time() - cached[0] < RESOLVE_CACHE_TTL:
@@ -224,25 +370,28 @@ def resolve_video_sync(url: str) -> dict:
         return job["result"]
 
     try:
-        info, last_err = None, None
-        for opts in (YDL_OPTS, YDL_OPTS_TV, YDL_OPTS_WEB):
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                if info.get("url"):
-                    break
-                last_err = "该客户端无直链 (SABR 限制)"
-            except Exception as e:
-                info, last_err = None, str(e)
-        if not info or not info.get("url"):
-            raise RuntimeError(f"解析失败: {last_err}")
+        # 快路径优先: InnerTube 一次往返拿直链 (~0.7s)
+        result = _resolve_via_innertube(url)
+        if result is None:
+            # 兜底: yt-dlp 客户端阶梯 android -> tv/ios -> web
+            info, last_err = None, None
+            for tier in range(len(_YDL_TIERS)):
+                try:
+                    info = _get_ydl(tier).extract_info(url, download=False)
+                    if info.get("url"):
+                        break
+                    last_err = "该客户端无直链 (SABR 限制)"
+                except Exception as e:
+                    info, last_err = None, str(e)
+            if not info or not info.get("url"):
+                raise RuntimeError(f"解析失败: {last_err}")
 
-        result = {
-            "title": info.get("title"),
-            "url": info["url"],
-            "ext": info.get("ext", ""),
-            "http_headers": info.get("http_headers", {}) or {},
-        }
+            result = {
+                "title": info.get("title"),
+                "url": info["url"],
+                "ext": info.get("ext", ""),
+                "http_headers": info.get("http_headers", {}) or {},
+            }
         if len(RESOLVE_CACHE) > 16:
             RESOLVE_CACHE.clear()
         RESOLVE_CACHE[url] = (time.time(), result)
@@ -280,17 +429,28 @@ async def _shutdown_http():
     await _HTTP.aclose()
 
 
+# googlevideo 403 兜底头: STREAM_HEADERS 未命中 (服务重启/缓存淘汰) 时使用,
+# 保证 sessionStorage 里的旧 play_url 走 /stream 仍可播放
+DEFAULT_STREAM_HEADERS = {"User-Agent": _INNERTUBE_UA, "Referer": "https://www.youtube.com/"}
+
+
 @app.get("/stream")
 async def stream_proxy(request: Request, u: str = Query(..., description="urlencode 后的播放直链")):
-    """直链流式代理: 透传 Range (支持拖动), 带上 Referer/UA 绕过 googlevideo 403。"""
+    """直链流式代理: 透传 Range (支持拖动), 带上 Referer/UA 绕过 googlevideo 403。
+
+    206 流式直通三要点 (原生 <video> 快速起播的关键):
+    1. 只透传浏览器的 Range —— 浏览器的 Referer (localhost) 不能转给 googlevideo,
+       UA/Referer 统一用解析时存下的客户端头; 缓存未命中回退默认 YouTube 头,
+       服务重启后 sessionStorage 里的旧 play_url 也能播。
+    2. content-range / content-length / accept-ranges 原样透传, 浏览器据此识别 206 分段。
+    3. aiter_raw 字节级直通: 上游来多少吐多少。aiter_bytes 会攒满 chunk_size 才吐,
+       首字节被累积缓冲拖慢, 与 <100ms 起播相悖。
+    """
     play_url = urllib.parse.unquote(u)
-    fwd: dict[str, str] = {}
-    for k in ("user-agent", "referer", "range"):
-        if k in request.headers:
-            fwd[k] = request.headers[k]
-    for k, v in STREAM_HEADERS.get(play_url, {}).items():
-        if k.lower() in ("user-agent", "referer") and k.lower() not in fwd:
-            fwd[k] = v
+    fwd = {k: v for k, v in STREAM_HEADERS.get(play_url, DEFAULT_STREAM_HEADERS).items()
+           if k.lower() in ("user-agent", "referer")}
+    if "range" in request.headers:
+        fwd["range"] = request.headers["range"]
 
     try:
         upstream = await _HTTP.send(
@@ -299,11 +459,12 @@ async def stream_proxy(request: Request, u: str = Query(..., description="urlenc
         raise HTTPException(status_code=502, detail=f"上游拉流失败: {e}")
 
     pass_headers = {k: v for k, v in upstream.headers.items()
-                    if k.lower() in ("content-type", "content-length", "content-range", "accept-ranges")}
+                    if k.lower() in ("content-type", "content-length", "content-range",
+                                     "accept-ranges", "content-encoding")}
 
     async def gen():
         try:
-            async for chunk in upstream.aiter_bytes(chunk_size=64 * 1024):
+            async for chunk in upstream.aiter_raw():
                 yield chunk
         finally:
             await upstream.aclose()
@@ -424,11 +585,13 @@ async def _inference_task(ws: WebSocket, ring: RingBuffer, producer: asyncio.Tas
 
 
 async def _start_session(ws: WebSocket, url: str,
-                         play_url: str | None = None, title: str | None = None) -> dict | None:
+                         play_url: str | None = None, title: str | None = None,
+                         start_at: float = 0.0) -> dict | None:
     """起推理轨 producer + 1Hz inference 两个任务。失败返回 None。
 
     客户端可携带已解析的 play_url (前端已通过 /resolve 预解析), 跳过 1.9s 的
     yt-dlp 解析, 使其不占用 TTFP / TTFF 关键路径; 请求头取自 /resolve 的缓存。
+    start_at: 从视频第几秒开始推理 (前端进度条拖动时同步跳转)。
     """
     if not MODEL_READY.is_set():
         await ws.send_text(json.dumps({"type": "error", "msg": "模型仍在加载中, 请稍候重试"}))
@@ -452,7 +615,7 @@ async def _start_session(ws: WebSocket, url: str,
         "ext": "m3u8" if "m3u8" in play_url else "mp4"}))
 
     ring = RingBuffer(capacity=RING_CAPACITY)
-    pipe = AsyncFramePipe(play_url, headers, fps=STREAM_FPS)
+    pipe = AsyncFramePipe(play_url, headers, fps=STREAM_FPS, start_at=start_at)
     producer = asyncio.create_task(_run_producer_task(pipe, ring, ws))
     infer = asyncio.create_task(_run_inference_task(ws, ring, producer))
     return {"pipe": pipe, "tasks": [producer, infer]}
@@ -496,7 +659,8 @@ async def ws_youtube(ws: WebSocket):
             if cmd.get("type") == "start":
                 session = await _start_session(
                     ws, cmd.get("url", ""),
-                    play_url=cmd.get("play_url"), title=cmd.get("title"))
+                    play_url=cmd.get("play_url"), title=cmd.get("title"),
+                    start_at=float(cmd.get("start_at") or 0))
             elif cmd.get("type") == "stop":
                 await ws.send_text(json.dumps({"type": "stopped"}))
     except WebSocketDisconnect:

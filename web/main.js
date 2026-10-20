@@ -9,7 +9,7 @@
 import Hls from 'hls.js'
 
 const $ = (id) => document.getElementById(id)
-const video = $('video')
+const playerA = $('video')
 const startBtn = $('startBtn')
 const stopBtn = $('stopBtn')
 const urlInput = $('urlInput')
@@ -25,6 +25,7 @@ let ttfpDone = false  // TTFP 只记第一条
 let hls = null        // hls.js 实例 (HLS 兜底)
 let lastPred = null   // 最近一条预测 (供人工反馈标注)
 let playing = false   // 会话进行中: 预缓冲不得抢占正在播放的 <video>
+let lastStart = null  // 最近一次 WS start 的载荷 (进度条拖动后带 start_at 重启推理轨)
 
 // ---------------------------------------------------------------------------
 // 概率条 (6 类: 5 舞种 + no_dance, Unknown 合并行按需渲染)
@@ -78,46 +79,84 @@ function setStatus(text, ok) {
 // ---------------------------------------------------------------------------
 // 播放轨: 直链 -> <video>
 // ---------------------------------------------------------------------------
-function markFirstFrame() {
-  // TTFF 打点只记一次 (loadeddata 与 rVFC 双路径互斥)
+function markFirstFrame(tNow) {
+  // TTFF 打点只记一次 (rVFC / loadeddata / rAF 多路径互斥)。
+  // tNow: rVFC 回调携带的帧呈现时刻 (DOMHighResTimeStamp), 比回调执行时再取
+  // performance.now() 更精确; 事件/无参路径退回 performance.now()
   if (ttffDone) return
   ttffDone = true
-  setMetric('ttffBox', 'ttff', performance.now() - tStart, 500)
+  const tFrame = typeof tNow === 'number' ? tNow : performance.now()
+  setMetric('ttffBox', 'ttff', tFrame - tStart, 500)
 }
 
-function attachSource(playUrl) {
-  destroyHls()
+// 双播放器轮换: active = 当前播放, idle = 预缓冲下一个 URL 的隐藏播放器。
+// 换 URL 时把已缓冲好的 idle 直接切前台 play(), 首帧只剩解码呈现 (~50ms);
+// 预缓冲挂在 idle 上也不再偷换 active 的 src (换视频首帧不再等现拉流 2s+)
+const playerB = document.createElement('video')
+playerB.playsInline = true
+playerB.muted = true
+playerB.controls = true
+playerB.style.display = 'none'
+playerA.parentNode.insertBefore(playerB, playerA.nextSibling)
+let active = playerA
+let idle = playerB
+
+function srcOf(el) { return el.getAttribute('src') || el._hlsUrl || '' }
+
+function attachSource(el, playUrl) {
+  if (el === active) destroyHls()
   // HLS (m3u8) 在 Chrome 需 hls.js; MP4 直链 video.src 直接播 (首帧最快路径)
   const isHls = playUrl.includes('m3u8')
   if (isHls && Hls.isSupported()) {
-    hls = new Hls({ maxBufferLength: 4, maxMaxBufferLength: 8 })
-    hls.loadSource(playUrl)
-    hls.attachMedia(video)
-    hls.on(Hls.Events.ERROR, (_, data) => setStatus('播放错误: ' + data.details))
+    const inst = new Hls({ maxBufferLength: 4, maxMaxBufferLength: 8 })
+    inst.loadSource(playUrl)
+    inst.attachMedia(el)
+    inst.on(Hls.Events.ERROR, (_, data) => setStatus('播放错误: ' + data.details))
+    if (el === active) hls = inst
+    el._hlsUrl = playUrl
   } else {
-    video.src = playUrl
-    video.preload = 'auto'   // 立即开始缓冲, 但不播放 (用户手势后才允许出声)
-    video.load()
+    el._hlsUrl = ''
+    el.src = playUrl
+    el.preload = 'auto'   // 立即开始缓冲, 但不播放 (用户手势后才允许出声)
+    el.load()
   }
 }
 
-// 预缓冲: URL 一解析就挂载 src 开始拉流/缓冲, 把媒体建连+首块下载移出 TTFF 关键路径
+function swapPlayers() {
+  active.pause()
+  active.style.display = 'none'
+  idle.style.display = ''
+  destroyHls()   // 旧 active 的 HLS 实例随切换释放
+  const t = active; active = idle; idle = t
+}
+
+// 预缓冲: URL 一解析就挂到闲置播放器开始拉流/缓冲, 正在播的 active 完全不受影响
 function prefetchMedia(playUrl) {
-  if (video.getAttribute('src') === playUrl || (hls && hls.url === playUrl)) return
-  attachSource(playUrl)
+  if (srcOf(active) === playUrl || srcOf(idle) === playUrl) return
+  if (playUrl.includes('m3u8')) return   // HLS (直播) 无需预缓冲
+  attachSource(idle, playUrl)
 }
 
 function playDirect(playUrl) {
-  // 已预缓冲同一源: 不重挂 src (否则缓冲作废, TTFF 恶化), 直接 play()
-  const buffered = video.getAttribute('src') === playUrl || (hls && hls.url === playUrl)
-  if (!buffered) attachSource(playUrl)
-  // TTFF: 点击 -> 首个渲染帧 (已缓冲时 loadeddata 早已触发, 必须用 rVFC 量真实出帧)
-  if (buffered && 'requestVideoFrameCallback' in HTMLVideoElement.prototype) {
-    video.requestVideoFrameCallback(() => markFirstFrame())
-  } else {
-    video.addEventListener('loadeddata', markFirstFrame, { once: true })
+  if (srcOf(active) !== playUrl) {
+    if (!playUrl.includes('m3u8') && srcOf(idle) === playUrl) {
+      swapPlayers()                 // 已预缓冲: 直接切前台 (换 URL 首帧 <500ms 的关键路径)
+    } else {
+      attachSource(active, playUrl) // 兜底: 未命中预缓冲, 现拉
+    }
   }
-  video.play().catch(() => {})
+  // TTFF: 点击 -> 首个真实渲染帧。rVFC 只在帧真正呈现到合成器时回调, 且回调的
+  // now 即帧呈现时刻 (loadeddata 在预缓冲期就触发过、也不代表可见帧, 精度口径不如 rVFC)
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    active.requestVideoFrameCallback((now) => markFirstFrame(now))
+  } else if (active.readyState >= 2) {
+    // 无 rVFC 的浏览器: 数据已缓冲时 loadeddata 早已触发过、不会再响,
+    // 用双 rAF 对齐 play() 后首帧呈现 (第一个 rAF 进入帧周期, 第二个在该帧绘制后)
+    requestAnimationFrame(() => requestAnimationFrame(() => markFirstFrame()))
+  } else {
+    active.addEventListener('loadeddata', markFirstFrame, { once: true })
+  }
+  active.play().catch(() => {})
 }
 
 function destroyHls() {
@@ -220,8 +259,16 @@ let resolveCache = null   // {url, play_url, title}
 let resolvePending = null
 
 function resolveVideo(url, verbose) {
+  url = canonicalUrl(url)  // 归一化 (去掉 &list= 等参数): 同一视频不同写法共享缓存
   if (resolveCache && resolveCache.url === url) return Promise.resolve(resolveCache)
   if (resolvePending && resolvePending.url === url) return resolvePending.promise
+  // sessionStorage 复用: 刷新页面后重播同一直链 (有效期 ~6h) 也秒开, TTFF 不再吃解析耗时
+  const ss = ssGet(url)
+  if (ss) {
+    resolveCache = { url, ...ss }
+    prefetchMedia(resolveCache.play_url)   // 预缓冲到闲置播放器, 播放中也安全
+    return Promise.resolve(resolveCache)
+  }
   // 超时自动重试 (共 3 次 x 30s): 慢解析的原任务在服务端继续跑完并进缓存,
   // 重试通常秒回缓存 —— 直接换 URL 即使 YouTube 限流也能换成功, 而不是报错放弃
   const p = (async () => {
@@ -235,9 +282,10 @@ function resolveVideo(url, verbose) {
         }
         const j = await r.json()
         resolveCache = { url, ...j }
+        ssSet(url, j)
         // 预缓冲: 解析完即开始拉媒体, TTFF 只剩 play->出帧。
-        // 会话进行中不换源: 否则画面被偷换到新视频, 而推理轨还在跑旧视频
-        if (!playing) prefetchMedia(resolveCache.play_url)
+        // 挂到闲置播放器, 播放中换 URL 也能提前缓冲好 (换视频首帧 <500ms)
+        prefetchMedia(resolveCache.play_url)
         return resolveCache
       } catch (e) {
         const retryable = e.name === 'TimeoutError' || e.name === 'TypeError'
@@ -256,10 +304,41 @@ function resolveVideo(url, verbose) {
   return p
 }
 
-urlInput.addEventListener('change', () => {
+// 归一化 YouTube URL -> 缓存键统一 (粘贴带 &list= 的链接与纯 watch?v= 共享预解析)
+function canonicalUrl(url) {
+  const m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]{11})/)
+  return m ? 'https://www.youtube.com/watch?v=' + m[1] : url
+}
+
+// resolve 结果 sessionStorage 缓存 (5.5h < 直链 6h 有效期): 页面刷新后重播也秒开
+function ssGet(url) {
+  try {
+    const raw = sessionStorage.getItem('dp_res:' + url)
+    if (!raw) return null
+    const o = JSON.parse(raw)
+    return Date.now() - o.ts < 5.5 * 3600e3 ? o.data : null
+  } catch { return null }
+}
+function ssSet(url, data) {
+  try { sessionStorage.setItem('dp_res:' + url, JSON.stringify({ ts: Date.now(), data })) } catch {}
+}
+
+// 预解析时机 (预热): 打字 300ms 防抖 / 粘贴立即 / 失焦立即 —— 把解析+媒体预缓冲
+// 藏进用户操作间隙, 点"播放并推理"时命中缓存, TTFF 关键路径只剩 play()。
+// 正则闸门只放行完整 YouTube URL, 避免逐键触发垃圾解析请求
+const YT_RE = /^https?:\/\/(www\.)?(youtube\.com\/(watch\?v=|shorts\/|embed\/)|youtu\.be\/)[\w-]{11}/
+let prefetchTimer = null
+function warmupNow() {
   const url = urlInput.value.trim()
-  if (url) resolveVideo(url).catch(() => {})  // 静默预热
+  if (YT_RE.test(url)) resolveVideo(url).catch(() => {})   // 静默预热, 失败不打扰用户
+}
+urlInput.addEventListener('input', () => {
+  clearTimeout(prefetchTimer)
+  prefetchTimer = setTimeout(warmupNow, 300)
 })
+urlInput.addEventListener('paste', () => setTimeout(warmupNow, 0))  // paste 时 value 尚未落位, 下一宏任务再读
+urlInput.addEventListener('blur', warmupNow)   // 光标离开输入框立即预热
+urlInput.addEventListener('change', warmupNow) // Enter 提交场景 (change 先于 blur 触发)
 
 startBtn.addEventListener('click', async () => {
   const url = urlInput.value.trim()
@@ -278,9 +357,9 @@ startBtn.addEventListener('click', async () => {
     playDirect(info.play_url)
     // 推理轨: WS start 带已解析直链, 服务端免重复解析
     await connectWS()
+    lastStart = { url, play_url: info.play_url, title: info.title }
     ws.send(JSON.stringify({
-      type: 'start', url,
-      play_url: info.play_url, title: info.title,   // 跳过服务端重复解析
+      type: 'start', ...lastStart,   // 跳过服务端重复解析
     }))
   } catch (e) {
     setStatus('解析失败: ' + e.message)
@@ -294,9 +373,28 @@ stopBtn.addEventListener('click', () => {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'stop' }))
   playing = false
   destroyHls()
-  video.removeAttribute('src')
-  video.load()
+  for (const el of [playerA, playerB]) {   // 双播放器一起清 (含闲置预缓冲)
+    el.pause()
+    el._hlsUrl = ''
+    el.removeAttribute('src')
+    el.load()
+  }
   setStatus('已停止')
   startBtn.disabled = false
   stopBtn.disabled = true
 })
+
+// 进度条拖动 (seeked): 推理轨带 start_at 重启, 同步到新播放位置。
+// 防抖 500ms —— 拖动过程会连续触发 seeked, 只在停稳后重启一次
+let seekTimer = null
+function onSeeked(e) {
+  if (e.target !== active) return   // 只响应当前播放器的拖动
+  clearTimeout(seekTimer)
+  seekTimer = setTimeout(() => {
+    if (playing && lastStart && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'start', ...lastStart, start_at: active.currentTime }))
+    }
+  }, 500)
+}
+playerA.addEventListener('seeked', onSeeked)
+playerB.addEventListener('seeked', onSeeked)

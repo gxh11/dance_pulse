@@ -11,11 +11,11 @@ scikit-learn==1.9.1
 matplotlib==3.11.2
 seaborn==0.13.2
 
-# 视频下载 (getvideo.py / download_direct.py)
+# 视频下载与解析 (download_direct.py / server.py /resolve 的 yt-dlp 阶梯兜底单例)
 yt-dlp==2026.8.19
 imageio-ffmpeg==0.6.0
 
-# 流式服务端 (server.py: FastAPI + WebSocket)
+# 流式服务端 (server.py: FastAPI + WebSocket) + InnerTube 解析快路径 / /stream 代理 (httpx 常驻连接池)
 fastapi==0.143.1
 uvicorn[standard]==0.54.0
 websockets==17.2

@@ -60,7 +60,7 @@ pip install -r requirements.txt
 
 ```
                         ┌──────────────── 播放轨 (低延迟) ────────────────┐
-YouTube URL ──▶ yt-dlp 解析直链 ──▶ GET /stream 代理 (透传 Range) ──▶ <video> 直接播放
+YouTube URL ──▶ 预解析直链 (InnerTube 快路径 / yt-dlp 兜底) ──▶ GET /stream 代理 (206 透传 Range) ──▶ <video> 直接播放
       │
       └──────────────── 推理轨 (1 Hz) ──────────────────────────────┐
           FFmpeg 子进程拉流 (rawvideo/rgb24, 8 FPS, 112x112)         │
@@ -71,7 +71,7 @@ YouTube URL ──▶ yt-dlp 解析直链 ──▶ GET /stream 代理 (透传 R
                     ONNX Runtime (CUDA, ~10 ms/次) ──▶ WS 推送 pred + 延迟时间戳
 ```
 
-- **播放轨**：`/resolve` 解析直链 → `/stream` 流式代理（带 Referer/UA 绕过 googlevideo 403）→ 浏览器 `<video>` 播放，支持拖动（Range 透传）
+- **播放轨**：打字/粘贴/失焦即**预解析**（`/resolve`：InnerTube 快路径 + yt-dlp 兜底 + 5 min 缓存）→ `/stream` 流式代理（206 Range 字节级透传，仅带解析时的 Referer/UA 绕过 googlevideo 403）→ 浏览器 `<video>` 播放，支持拖动
 - **推理轨**：FFmpeg 从同一 URL 拉流抽帧 → 内存 `RingBuffer` → 16 帧滑窗（约 2 秒上下文）→ 3D-CNN 推理
 - **1 Hz 节流**：视频时间去重（0.8s）+ 墙钟间隔（1.0s）双条件，真实 1 次/秒而非重复推理同帧
 - **零落盘**：抽帧走 FFmpeg stdout 管道直接进内存，全程不写任何视频/帧文件
@@ -82,14 +82,15 @@ YouTube URL ──▶ yt-dlp 解析直链 ──▶ GET /stream 代理 (透传 R
 
 | 指标 | 口径 | 目标 | 实测 |
 |---|---|---|---|
-| **TTFF** 首帧 | 点击播放 → 首个渲染帧 | < 500 ms | **52 ms** |
-| **E2E** 端到端 | 服务端抽帧入队 `frame_ts` → 前端渲染完预测 | < 1000 ms | **134 ms** |
-| **TTFP** 首条预测 | 点击 → 第一条预测（含解析 + 起流 + 暖机） | ≤ 4 s | **1.8 s** |
+| **TTFF** 首帧 | 点击播放 → 首个渲染帧 | < 500 ms | **37–58 ms** |
+| **E2E** 端到端 | 服务端抽帧入队 `frame_ts` → 前端渲染完预测 | < 1000 ms | **84–160 ms** |
+| **TTFP** 首条预测 | 点击 → 第一条预测（含解析 + 起流 + 暖机） | ≤ 4 s | **1.8–3 s** |
 
 关键优化：
 
-- **TTFF**：URL 一输入即预解析（`/resolve`）并**预缓冲媒体**，点击后只剩 `play()` → 出帧；首帧用 `requestVideoFrameCallback` 精确打点
-- **TTFP**：WS `start` 携带已解析直链（跳过重复 yt-dlp）；启动期 ONNX 预热（冷启动 453 ms → 热 17 ms）；预热窗 6 帧即出首条预测（左侧 pad 到 16，与训练 pad 逻辑一致）
+- **TTFF**：打字（300 ms 防抖）/ 粘贴 / 失焦即触发**预解析 + 预缓冲**，点击后只剩 `play()` → 出帧；首帧用 `requestVideoFrameCallback` 回调携带的**帧呈现时刻 `now`** 精确打点（无 rVFC 浏览器双 `rAF` 对齐出帧，兜底 `loadeddata` 只在数据未就绪时生效——预热后该事件早已触发过）
+- **解析**：InnerTube 快路径一次往返取单流直链（**358–642 ms**），5 min 内存缓存命中 **~0 ms**；yt-dlp 兜底阶梯（android → tv/ios → web）极简参数跳过 DASH/HLS manifest、网页与 JS 播放器嗅探（**~758 ms**，原全量嗅探约 2 s）；启动期后台预热 visitorData，消除首解析约 5 s 的冷连接惩罚
+- **TTFP**：WS `start` 携带已解析直链（跳过重复解析）；启动期 ONNX 预热（冷启动 453 ms → 热 17 ms）；预热窗 6 帧即出首条预测（左侧 pad 到 16，与训练 pad 逻辑一致）
 - **E2E**：每条 `pred` 携带 `frame_ts`（窗口最新帧入队时刻），前端 `Date.now() - frame_ts` 即真实画面→预测延迟
 
 ---
@@ -99,8 +100,8 @@ YouTube URL ──▶ yt-dlp 解析直链 ──▶ GET /stream 代理 (透传 R
 | 接口 | 说明 |
 |---|---|
 | `GET /health` | 服务状态、模型、设备、ONNX 提供方 |
-| `GET /resolve` | yt-dlp 解析 YouTube URL → 播放直链 + 标题 |
-| `GET /stream` | 直链流式代理（透传 Range 支持拖动） |
+| `GET /resolve` | 解析 YouTube URL → 播放直链 + 标题（InnerTube 快路径优先，yt-dlp 阶梯兜底，5 min 缓存 + single-flight 去重） |
+| `GET /stream` | 直链流式代理（206 Range 透传支持拖动，`aiter_raw` 字节级直通、不攒完整响应） |
 | `POST /feedback` | 人工反馈标注（`correct`/`wrong`）→ 追加写 `logs/feedback.jsonl` |
 | `WS /ws/youtube` | 双轨流式推理：`start`/`stop` 控制，1Hz 推送预测（带延迟时间戳） |
 | `WS /ws/stream` | 摄像头推帧模式（兼容保留）：客户端推二进制帧 → 回传 JSON 预测 |
@@ -210,20 +211,22 @@ dance-pulse/
 ├── inference_engine.py         # ONNX 推理封装 (6 分类, CUDA 自动回退 CPU)
 ├── make_splits.py              # 组级防泄漏三路切分生成 ★
 ├── train_6class.py             # 6 分类训练 + 评估 (5 舞种 + no_dance) ★核心
+├── train_from_splits.py        # 按 splits 划分训练
 ├── add_no_dance_category.py    # 非舞蹈负样本生成 (源 URL 留档 sources.json)
-├── predict.py                  # 单文件预测
+├── add_dancer_diversity.py     # 舞者多样性数据采集
+├── predict.py                  # 单文件预测 (离线测试工具)
 ├── export_onnx_6class.py       # 6 分类 ONNX 导出 + 测速
 ├── web/                        # 前端 SPA (Vite + hls.js): 播放器 + 延迟指标 + 实时预测
 ├── Dockerfile                  # 多阶段镜像: vite 构建前端 + CUDA 推理服务
 ├── docker-compose.yml          # 一键部署 (CPU), 挂载 ./checkpoints
 ├── docker-compose.gpu.yml      # GPU 覆盖层 (NVIDIA Container Toolkit)
-├── getvideo.py                 # 视频下载
 ├── download_direct.py          # AIST++ 直接下载 (5 个舞种)
 ├── categorize_videos.py        # 按舞种整理到子目录
 ├── dataclear.py                # 数据清理
+├── ignore_list.txt             # 数据下载忽略清单
 ├── requirements.txt
 ├── checkpoints/                # 权重、混淆矩阵、PR 曲线、ONNX (Docker volume 挂载)
-├── frame_cache/                # 一次性帧缓存 (682 个 .npy), 训练提速
+├── frame_cache/                # 一次性帧缓存 (.npy, 可再生成), 训练提速 ~80x
 ├── dance_dataset_categorized/  # 按舞种分类的视频
 ├── splits/                     # 原始 txt 划分
 └── aistplusplus_dataset/       # AIST++ 元数据
@@ -234,6 +237,7 @@ dance-pulse/
 ## 实现注意事项
 
 - **Windows + `uvicorn --reload`**：uvicorn 会强制 `SelectorEventLoop`（不支持 `asyncio.create_subprocess_exec`），故 `youtube_pipe.py` 用 `subprocess.Popen` + 读取线程泵帧入队列，与事件循环类型解耦
+- **YouTube 解析链路**：InnerTube 快路径用免签名 client 一次取单流 MP4 直链；yt-dlp 兜底为 thread-local 常驻单例（android → tv/ios → web 阶梯，`socket_timeout=10` / `retries=1` 硬上限）；同 URL single-flight 去重 + 5 min TTL 缓存防 YouTube 限流；启动期后台预热 visitorData（首解析可慢至 ~5 s）
 - **ONNX Runtime CUDA**：`onnxruntime-gpu` 需与 torch 的 CUDA 大版本一致（1.22.0 ↔ CUDA 12.x；1.23+ 需 CUDA 13 不兼容）；Windows 下依赖 torch wheel 自带的 cublas/cudnn DLL，容器内由 ldconfig 注册
 - **视频源限速**：FFmpeg 加 `-re` 按原生帧率拉流，否则 MP4 数秒解完导致队列冻结、帧时间戳老化
 

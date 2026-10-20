@@ -28,13 +28,15 @@ class AsyncFramePipe:
     """
 
     def __init__(self, url: str, headers: dict | None = None,
-                 width: int = INPUT_SIZE, height: int = INPUT_SIZE, fps: int = 8):
+                 width: int = INPUT_SIZE, height: int = INPUT_SIZE, fps: int = 8,
+                 start_at: float = 0.0):
         self.url = url
         self.headers = dict(headers or {})
         self.width = int(width)
         self.height = int(height)
         self.frame_bytes = self.width * self.height * RGB_CHANNELS
         self.fps = int(fps)
+        self.start_at = max(0.0, float(start_at))   # 从视频第几秒开始拉流 (进度条拖动)
         self._proc: subprocess.Popen | None = None
         self._q: queue.Queue = queue.Queue(maxsize=128)
         self._reader: threading.Thread | None = None
@@ -45,6 +47,8 @@ class AsyncFramePipe:
             # ffmpeg -headers 需要 "Key: Value\r\n" 格式
             hdr = "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())
             cmd += ["-headers", hdr]
+        if self.start_at > 0:
+            cmd += ["-ss", f"{self.start_at:.2f}"]  # 输入端 seek: 进度条拖动后推理轨同步跳转
         cmd += [
             "-re",                               # 按原生帧率节流: 否则 MP4 会在数秒内被解完,
                                                  # 队列冻结导致帧时间戳老化, 端到端延迟失控
